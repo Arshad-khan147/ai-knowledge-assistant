@@ -4,6 +4,10 @@ import pytest
 from io import BytesIO
 from pypdf import PdfWriter
 import app.api as api
+from types import SimpleNamespace
+
+import app.rag as rag
+from langchain_core.documents import Document
 
 
 TEST_API_KEY = "test-only-secret-key"
@@ -227,3 +231,105 @@ def test_upload_rejects_encrypted_pdf(auth_headers):
     assert response.json()["detail"] == (
         "Encrypted PDFs are not supported."
     )
+
+
+def test_rag_adds_source_ids_to_context(monkeypatch):
+    documents = [
+        (
+            Document(
+                page_content="FastAPI supports asynchronous endpoints.",
+                metadata={"source": "fastapi.pdf", "page": 2},
+            ),
+            0.85,
+        ),
+        (
+            Document(
+                page_content="Python supports async and await.",
+                metadata={"source": "python.pdf", "page": 4},
+            ),
+            0.80,
+        ),
+    ]
+
+    captured = {}
+
+    class FakeRagChain:
+        def invoke(self, payload):
+            captured.update(payload)
+            return SimpleNamespace(
+                content="FastAPI supports asynchronous endpoints [S1]."
+            )
+
+    monkeypatch.setattr(
+        rag, "retrieve_documents", lambda question, k: documents
+    )
+    monkeypatch.setattr(rag, "rag_chain", FakeRagChain())
+
+    result = rag.ask_question("How does FastAPI handle async?", k=2)
+
+    assert "[S1]" in captured["context"]
+    assert "[S2]" in captured["context"]
+    assert "fastapi.pdf" in captured["context"]
+    assert "python.pdf" in captured["context"]
+
+    assert result["sources"][0]["id"] == "S1"
+    assert result["sources"][1]["id"] == "S2"
+    assert result["sources"][0]["page"] == 2
+
+
+def test_rag_skips_llm_when_no_relevant_documents(monkeypatch):
+    documents = [
+        (
+            Document(
+                page_content="Information about cooking.",
+                metadata={"source": "cooking.pdf", "page": 1},
+            ),
+            0.30,
+        ),
+    ]
+
+    class FakeRagChain:
+        def invoke(self, payload):
+            raise AssertionError("LLM should not be called")
+
+    monkeypatch.setattr(
+        rag, "retrieve_documents", lambda question, k: documents
+    )
+    monkeypatch.setattr(rag, "rag_chain", FakeRagChain())
+
+    result = rag.ask_question("Explain database indexing", k=3)
+
+    assert result["answer"] == rag.NO_ANSWER
+    assert result["sources"] == []
+
+
+def test_rag_returns_matching_source_metadata(monkeypatch):
+    documents = [
+        (
+            Document(
+                page_content="Qdrant stores and searches vectors.",
+                metadata={"source": "qdrant-guide.pdf", "page": 7},
+            ),
+            0.91,
+        ),
+    ]
+
+    class FakeRagChain:
+        def invoke(self, payload):
+            return SimpleNamespace(
+                content="Qdrant searches vectors [S1]."
+            )
+
+    monkeypatch.setattr(
+        rag, "retrieve_documents", lambda question, k: documents
+    )
+    monkeypatch.setattr(rag, "rag_chain", FakeRagChain())
+
+    result = rag.ask_question("What does Qdrant do?", k=1)
+
+    assert "[S1]" in result["answer"]
+    assert len(result["sources"]) == 1
+    assert result["sources"][0]["id"] == "S1"
+    assert result["sources"][0]["source"] == "qdrant-guide.pdf"
+    assert result["sources"][0]["page"] == 7
+    assert result["sources"][0]["score"] == 0.91
