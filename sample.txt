@@ -1,0 +1,16 @@
+
+Python is a programming language known for its readability.
+Python supports object-oriented and functional programming.
+
+FastAPI is a Python framework used to build APIs.
+FastAPI supports asynchronous endpoints and automatic API documentation.
+
+Asyncio is a Python library for asynchronous programming.
+The event loop schedules and runs asynchronous tasks.
+Asyncio is especially useful for I/O-bound operations.
+
+Python threading allows multiple threads to execute within a process.
+Threading can be useful for I/O-bound tasks such as network requests.
+
+Qdrant is a vector database designed for similarity search.
+It stores vectors and associated payload data.
