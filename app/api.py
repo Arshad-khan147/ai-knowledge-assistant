@@ -1,26 +1,33 @@
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-import secrets
-import os
-from fastapi import Depends, Header
-from app.rag import ask_question
-import logging
-logger = logging.getLogger(__name__)
 import json
+import logging
+import os
+import secrets
 from io import BytesIO
-from pypdf import PdfReader
+from pathlib import Path
 
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from pypdf import PdfReader
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
-from app.rag import rag_chain
+from app.ingestion import ingest_pdf_file
+from app.rag import ask_question, rag_chain
 from app.retrieval import retrieve_documents
 
-from pathlib import Path
-from fastapi import File, UploadFile
-from app.ingestion import ingest_pdf_file
 
-
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="PDF Knowledge Assistant API",
@@ -28,7 +35,18 @@ app = FastAPI(
     version="1.0.0",
 )
 
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(
+    RateLimitExceeded,
+    _rate_limit_exceeded_handler,
+)
+
 API_ACCESS_KEY = os.getenv("API_ACCESS_KEY")
+
+DOCUMENTS_DIR = Path("documents")
+MAX_PDF_SIZE = 20 * 1024 * 1024  # 20 MB
+RELEVANCE_THRESHOLD = 0.70
 
 
 def require_api_key(
@@ -50,6 +68,7 @@ def require_api_key(
             headers={"WWW-Authenticate": "ApiKey"},
         )
 
+
 class QuestionRequest(BaseModel):
     question: str = Field(
         min_length=1,
@@ -65,6 +84,7 @@ class QuestionRequest(BaseModel):
 
 
 class SourceResponse(BaseModel):
+    id: str | None = None
     text: str
     source: str
     page: int | str
@@ -86,16 +106,14 @@ def health_check():
     response_model=QuestionResponse,
     dependencies=[Depends(require_api_key)],
 )
-def ask(request: QuestionRequest):
+@limiter.limit("10/minute")
+def ask(request: Request, payload: QuestionRequest):
     try:
-        result = ask_question(
-            question=request.question,
-            k=request.top_k,
+        return ask_question(
+            question=payload.question,
+            k=payload.top_k,
         )
-        return result
     except Exception as exc:
-        # Log the full exception on the server; avoid exposing secrets
-        # or internal error details to API clients.
         logger.exception("RAG request failed")
         raise HTTPException(
             status_code=500,
@@ -107,24 +125,21 @@ def ask(request: QuestionRequest):
     "/ask/stream",
     dependencies=[Depends(require_api_key)],
 )
-def ask_stream(request: QuestionRequest):
+@limiter.limit("5/minute")
+def ask_stream(request: Request, payload: QuestionRequest):
     def event_stream():
         try:
-            # 1. Retrieve relevant document chunks.
             results = retrieve_documents(
-                question=request.question,
-                k=request.top_k,
+                question=payload.question,
+                k=payload.top_k,
             )
 
-            # 2. Apply the same relevance threshold.
-            threshold = 0.70
             relevant_results = [
-                (document, score)
+                (document, float(score))
                 for document, score in results
-                if float(score) >= threshold
+                if float(score) >= RELEVANCE_THRESHOLD
             ]
 
-            # 3. If nothing is relevant, don't call the LLM.
             if not relevant_results:
                 fallback = (
                     "I couldn't find sufficiently relevant information "
@@ -146,31 +161,42 @@ def ask_stream(request: QuestionRequest):
                 }) + "\n\n"
                 return
 
-            # 4. Prepare the context and source metadata.
-            context = "\n\n".join(
-                document.page_content
-                for document, score in relevant_results
-            )
+            context_parts = []
+            sources = []
 
-            sources = [
-                {
-                    "source": document.metadata.get("source", "unknown"),
-                    "page": document.metadata.get("page", "unknown"),
-                    "score": round(float(score), 4),
+            for index, (document, score) in enumerate(
+                relevant_results,
+                start=1,
+            ):
+                source_id = f"S{index}"
+                source_name = document.metadata.get("source", "unknown")
+                page = document.metadata.get("page", "unknown")
+
+                context_parts.append(
+                    f"[{source_id}]\n"
+                    f"Document: {source_name}\n"
+                    f"Page: {page}\n"
+                    f"Content:\n{document.page_content}"
+                )
+
+                sources.append({
+                    "id": source_id,
+                    "source": source_name,
+                    "page": page,
+                    "score": round(score, 4),
                     "text": document.page_content,
-                }
-                for document, score in relevant_results
-            ]
+                })
+
+            context = "\n\n---\n\n".join(context_parts)
 
             yield "data: " + json.dumps({
                 "type": "sources",
                 "sources": sources,
             }) + "\n\n"
 
-            # 5. Stream the LLM output as it arrives.
             for chunk in rag_chain.stream({
                 "context": context,
-                "question": request.question,
+                "question": payload.question,
             }):
                 content = chunk.content
 
@@ -180,15 +206,12 @@ def ask_stream(request: QuestionRequest):
                         "content": content,
                     }) + "\n\n"
 
-            # 6. Signal that the stream has finished.
             yield "data: " + json.dumps({
                 "type": "done",
             }) + "\n\n"
 
-        except Exception as exc:
-            # Keep internal errors out of the client response.
+        except Exception:
             logger.exception("Streaming request failed")
-
             yield "data: " + json.dumps({
                 "type": "error",
                 "message": "Failed to process the question.",
@@ -202,11 +225,6 @@ def ask_stream(request: QuestionRequest):
             "X-Accel-Buffering": "no",
         },
     )
-
-
-
-DOCUMENTS_DIR = Path("documents")
-MAX_PDF_SIZE = 20 * 1024 * 1024  # 20 MB
 
 
 def validate_pdf_content(content: bytes) -> None:
@@ -241,70 +259,73 @@ def validate_pdf_content(content: bytes) -> None:
             detail="The uploaded file is not a readable PDF.",
         ) from exc
 
+
 @app.post(
     "/documents/upload",
     dependencies=[Depends(require_api_key)],
 )
-async def upload_document(file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(
-            status_code=400,
-            detail="A filename is required.",
-        )
-
-    # Keep only the filename, not any user-supplied directory path.
-    filename = Path(file.filename).name
-
-    if not filename.lower().endswith(".pdf"):
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF files are supported.",
-        )
-
-    DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    destination = DOCUMENTS_DIR / filename
-
-    if destination.exists():
-        raise HTTPException(
-            status_code=409,
-            detail="A document with this filename already exists.",
-        )
-
-    content = await file.read(MAX_PDF_SIZE + 1)
-
-    if len(content) > MAX_PDF_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail="The PDF exceeds the 20 MB upload limit.",
-        )
-
-    # Basic file signature check. The PDF loader must still parse the file.
-    validate_pdf_content(content)
-
-    destination.write_bytes(content)
-
+@limiter.limit("5/minute")
+async def upload_document(
+    request: Request,
+    file: UploadFile = File(...),
+):
     try:
-        result = ingest_pdf_file(
-            pdf_path=destination,
-            source_name=filename,
-        )
-    except Exception as exc:
-        logger.exception("PDF ingestion failed for %s", filename)
-        # Keep the file so ingestion can be retried and investigated.
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "The PDF was saved, but ingestion failed. "
-                "Check the server logs before retrying."
-            ),
-        ) from exc
+        if not file.filename:
+            raise HTTPException(
+                status_code=400,
+                detail="A filename is required.",
+            )
+
+        filename = Path(file.filename).name
+
+        if not filename.lower().endswith(".pdf"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only PDF files are supported.",
+            )
+
+        DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+        destination = DOCUMENTS_DIR / filename
+
+        if destination.exists():
+            raise HTTPException(
+                status_code=409,
+                detail="A document with this filename already exists.",
+            )
+
+        content = await file.read(MAX_PDF_SIZE + 1)
+
+        if len(content) > MAX_PDF_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail="The PDF exceeds the 20 MB upload limit.",
+            )
+
+        validate_pdf_content(content)
+        destination.write_bytes(content)
+
+        try:
+            result = ingest_pdf_file(
+                pdf_path=destination,
+                source_name=filename,
+            )
+        except Exception as exc:
+            logger.exception("PDF ingestion failed for %s", filename)
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "The PDF was saved, but ingestion failed. "
+                    "Check the server logs before retrying."
+                ),
+            ) from exc
+
+        return {
+            "message": "PDF uploaded and ingested successfully.",
+            **result,
+        }
+
     finally:
         await file.close()
-
-    return {
-        "message": "PDF uploaded and ingested successfully.",
-        **result,
-    }
 
 
 @app.get(
@@ -314,13 +335,13 @@ async def upload_document(file: UploadFile = File(...)):
 def list_documents():
     DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    documents = []
-
-    for pdf_path in sorted(DOCUMENTS_DIR.glob("*.pdf")):
-        documents.append({
+    documents = [
+        {
             "filename": pdf_path.name,
             "size_bytes": pdf_path.stat().st_size,
-        })
+        }
+        for pdf_path in sorted(DOCUMENTS_DIR.glob("*.pdf"))
+    ]
 
     return {
         "count": len(documents),

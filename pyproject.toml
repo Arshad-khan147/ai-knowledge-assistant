@@ -19,6 +19,7 @@ dependencies = [
     "python-dotenv>=1.2.4",
     "python-multipart>=0.0.32",
     "qdrant-client>=1.19.1",
+    "slowapi>=0.1.10",
     "uvicorn[standard]>=0.54.0",
 ]
 

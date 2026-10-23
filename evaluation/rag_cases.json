@@ -1,0 +1,15 @@
+
+[
+  {
+    "question": "what is cloud computing? and what are the different types of cloud computing?",
+    "expected_sources": ["unit 2 cloud computing.pdf"]
+  },
+  {
+    "question": "what is the difference between IaaS, PaaS, and SaaS?",
+    "expected_sources": ["unit 3 cloud computing.pdf"]
+  },
+  {
+    "question": "what is cyber security and why do we need it?",
+    "expected_sources": ["VIRTUAL INTERNSHIP AT CISCO.pdf"]
+  }
+]
