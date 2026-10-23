@@ -1,7 +1,9 @@
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-
+import secrets
+import os
+from fastapi import Depends, Header
 from app.rag import ask_question
 
 import json
@@ -23,6 +25,27 @@ app = FastAPI(
     version="1.0.0",
 )
 
+API_ACCESS_KEY = os.getenv("API_ACCESS_KEY")
+
+
+def require_api_key(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+):
+    if not API_ACCESS_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="API authentication is not configured.",
+        )
+
+    if not x_api_key or not secrets.compare_digest(
+        x_api_key,
+        API_ACCESS_KEY,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key.",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
 
 class QuestionRequest(BaseModel):
     question: str = Field(
@@ -55,7 +78,11 @@ def health_check():
     return {"status": "healthy"}
 
 
-@app.post("/ask", response_model=QuestionResponse)
+@app.post(
+    "/ask",
+    response_model=QuestionResponse,
+    dependencies=[Depends(require_api_key)],
+)
 def ask(request: QuestionRequest):
     try:
         result = ask_question(
@@ -73,7 +100,10 @@ def ask(request: QuestionRequest):
         ) from exc
 
 
-@app.post("/ask/stream")
+@app.post(
+    "/ask/stream",
+    dependencies=[Depends(require_api_key)],
+)
 def ask_stream(request: QuestionRequest):
     def event_stream():
         try:
@@ -176,7 +206,10 @@ DOCUMENTS_DIR = Path("documents")
 MAX_PDF_SIZE = 20 * 1024 * 1024  # 20 MB
 
 
-@app.post("/documents/upload")
+@app.post(
+    "/documents/upload",
+    dependencies=[Depends(require_api_key)],
+)
 async def upload_document(file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(
@@ -243,7 +276,10 @@ async def upload_document(file: UploadFile = File(...)):
     }
 
 
-@app.get("/documents")
+@app.get(
+    "/documents",
+    dependencies=[Depends(require_api_key)],
+)
 def list_documents():
     DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
