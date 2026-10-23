@@ -5,7 +5,8 @@ import secrets
 import os
 from fastapi import Depends, Header
 from app.rag import ask_question
-
+import logging
+logger = logging.getLogger(__name__)
 import json
 
 from fastapi.responses import StreamingResponse
@@ -93,7 +94,7 @@ def ask(request: QuestionRequest):
     except Exception as exc:
         # Log the full exception on the server; avoid exposing secrets
         # or internal error details to API clients.
-        print(f"RAG request failed: {exc}")
+        logger.exception("RAG request failed")
         raise HTTPException(
             status_code=500,
             detail="Failed to process the question. Check the server logs.",
@@ -184,7 +185,7 @@ def ask_stream(request: QuestionRequest):
 
         except Exception as exc:
             # Keep internal errors out of the client response.
-            print(f"Streaming request failed: {exc}")
+            logger.exception("Streaming request failed")
 
             yield "data: " + json.dumps({
                 "type": "error",
@@ -258,7 +259,7 @@ async def upload_document(file: UploadFile = File(...)):
             source_name=filename,
         )
     except Exception as exc:
-        print(f"PDF ingestion failed for {filename}: {exc}")
+        logger.exception("PDF ingestion failed for %s", filename)
         # Keep the file so ingestion can be retried and investigated.
         raise HTTPException(
             status_code=500,
