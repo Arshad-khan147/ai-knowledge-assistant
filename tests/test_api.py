@@ -1,7 +1,8 @@
 
 from fastapi.testclient import TestClient
 import pytest
-
+from io import BytesIO
+from pypdf import PdfWriter
 import app.api as api
 
 
@@ -161,3 +162,68 @@ def test_ask_rejects_invalid_api_key():
     )
 
     assert response.status_code == 401
+
+
+def test_upload_rejects_fake_pdf(auth_headers):
+    response = client.post(
+        "/documents/upload",
+        headers=auth_headers,
+        files={
+            "file": (
+                "fake.pdf",
+                b"%PDF-not-a-real-pdf",
+                "application/pdf",
+            )
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "The uploaded file is not a readable PDF."
+    )
+
+
+def test_upload_rejects_oversized_file(
+    auth_headers, monkeypatch
+):
+    monkeypatch.setattr(api, "MAX_PDF_SIZE", 10)
+
+    response = client.post(
+        "/documents/upload",
+        headers=auth_headers,
+        files={
+            "file": (
+                "large.pdf",
+                b"%PDF-" + b"x" * 20,
+                "application/pdf",
+            )
+        },
+    )
+
+    assert response.status_code == 413
+    assert "upload limit" in response.json()["detail"].lower()
+
+
+def test_upload_rejects_encrypted_pdf(auth_headers):
+    pdf_buffer = BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.encrypt("test-password")
+    writer.write(pdf_buffer)
+
+    response = client.post(
+        "/documents/upload",
+        headers=auth_headers,
+        files={
+            "file": (
+                "encrypted.pdf",
+                pdf_buffer.getvalue(),
+                "application/pdf",
+            )
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "Encrypted PDFs are not supported."
+    )

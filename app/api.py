@@ -8,6 +8,8 @@ from app.rag import ask_question
 import logging
 logger = logging.getLogger(__name__)
 import json
+from io import BytesIO
+from pypdf import PdfReader
 
 from fastapi.responses import StreamingResponse
 
@@ -207,6 +209,38 @@ DOCUMENTS_DIR = Path("documents")
 MAX_PDF_SIZE = 20 * 1024 * 1024  # 20 MB
 
 
+def validate_pdf_content(content: bytes) -> None:
+    """Validate that uploaded bytes can be parsed as a readable PDF."""
+
+    if not content.startswith(b"%PDF-"):
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file does not have a valid PDF signature.",
+        )
+
+    try:
+        reader = PdfReader(BytesIO(content), strict=False)
+
+        if reader.is_encrypted:
+            raise HTTPException(
+                status_code=400,
+                detail="Encrypted PDFs are not supported.",
+            )
+
+        if len(reader.pages) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="The PDF contains no readable pages.",
+            )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is not a readable PDF.",
+        ) from exc
+
 @app.post(
     "/documents/upload",
     dependencies=[Depends(require_api_key)],
@@ -245,11 +279,7 @@ async def upload_document(file: UploadFile = File(...)):
         )
 
     # Basic file signature check. The PDF loader must still parse the file.
-    if not content.startswith(b"%PDF-"):
-        raise HTTPException(
-            status_code=400,
-            detail="The uploaded file does not have a valid PDF signature.",
-        )
+    validate_pdf_content(content)
 
     destination.write_bytes(content)
 
